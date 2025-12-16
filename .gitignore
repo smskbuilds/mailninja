@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local Data & Debug
+trusted-senders.json
+public/debug.json
+public/debug_suggestions.json
+example-grouping.md
