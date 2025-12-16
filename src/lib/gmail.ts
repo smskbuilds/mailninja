@@ -168,6 +168,13 @@ export class GmailClient {
         return response.data;
     }
 
+    async getFilters(): Promise<gmail_v1.Schema$Filter[]> {
+        const response = await this.gmail.users.settings.filters.list({
+            userId: "me",
+        });
+        return response.data.filter || [];
+    }
+
     async getMessageCount(query: string): Promise<number> {
         let count = 0;
         let pageToken: string | undefined = undefined;

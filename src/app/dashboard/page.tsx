@@ -9,6 +9,7 @@ interface EmailCluster {
     domain: string;
     sender: string;
     count: number;
+    countDisplay?: string;
     suggestedAction: "archive" | "label" | "keep" | "filter";
     suggestedLabel?: string;
     messageIds: string[];
@@ -36,10 +37,18 @@ interface InboxStats {
     filterSuggestions: number;
 }
 
+interface ExistingFilter {
+    id: string;
+    from: string;
+    inboxCount: number;
+    inboxCountDisplay: string;
+}
+
 interface AnalysisResult {
     stats: InboxStats;
     clusters: EmailCluster[];
     filterSuggestions: FilterSuggestion[];
+    existingFilters: ExistingFilter[];
 }
 
 export default function Dashboard() {
@@ -50,6 +59,9 @@ export default function Dashboard() {
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
     const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
+    const [loadingStage, setLoadingStage] = useState<string>("Connecting to Gmail...");
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [processingMessage, setProcessingMessage] = useState<string>("");
 
     const showToast = (message: string, type: "success" | "error") => {
         setToast({ message, type });
@@ -59,12 +71,30 @@ export default function Dashboard() {
     const fetchAnalysis = useCallback(async () => {
         if (!session?.accessToken) return;
 
+        // Simulate progress stages during the API call
+        setLoadingStage("Connecting to Gmail...");
+
+        // Start showing progress while API works
+        const progressInterval = setInterval(() => {
+            setLoadingStage(prev => {
+                if (prev.includes("Connecting")) return "Getting inbox stats...";
+                if (prev.includes("inbox stats")) return "Fetching recent emails...";
+                if (prev.includes("emails")) return "Checking existing filters...";
+                if (prev.includes("existing filters")) return "Getting accurate counts...";
+                return prev;
+            });
+        }, 2000);
+
         try {
             const response = await fetch("/api/gmail/analyze");
+            clearInterval(progressInterval);
+            setLoadingStage("Finishing up...");
+
             if (!response.ok) throw new Error("Failed to analyze inbox");
             const data = await response.json();
             setAnalysis(data);
         } catch (error) {
+            clearInterval(progressInterval);
             console.error("Analysis error:", error);
             showToast("Failed to analyze inbox", "error");
         } finally {
@@ -123,6 +153,9 @@ export default function Dashboard() {
     };
 
     const handleCreateFilter = async (suggestion: FilterSuggestion) => {
+        setIsProcessing(true);
+        setProcessingMessage(`Creating filter and archiving emails from ${suggestion.criteria.from}...`);
+
         try {
             const response = await fetch("/api/gmail/actions", {
                 method: "POST",
@@ -131,12 +164,20 @@ export default function Dashboard() {
                     action: "createFilter",
                     criteria: suggestion.criteria,
                     filterAction: suggestion.action,
+                    archiveExisting: true, // Also archive existing emails from this sender
                 }),
             });
 
             if (!response.ok) throw new Error("Failed to create filter");
 
-            showToast(`Filter created for ${suggestion.criteria.from}`, "success");
+            const result = await response.json();
+            const archivedCount = result.archivedCount || 0;
+
+            showToast(
+                `Filter created for ${suggestion.criteria.from}` +
+                (archivedCount > 0 ? ` and archived ${archivedCount} emails` : ""),
+                "success"
+            );
 
             // Remove suggestion from list
             if (analysis) {
@@ -148,6 +189,9 @@ export default function Dashboard() {
         } catch (error) {
             console.error("Filter error:", error);
             showToast("Failed to create filter", "error");
+        } finally {
+            setIsProcessing(false);
+            setProcessingMessage("");
         }
     };
 
@@ -157,6 +201,30 @@ export default function Dashboard() {
                 ...analysis,
                 filterSuggestions: analysis.filterSuggestions.filter(s => s.id !== suggestionId),
             });
+        }
+    };
+
+    const handleArchiveFromFilter = async (filter: ExistingFilter) => {
+        try {
+            const response = await fetch("/api/gmail/actions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    action: "archiveFromSender",
+                    sender: filter.from,
+                }),
+            });
+
+            if (!response.ok) throw new Error("Failed to archive");
+
+            const result = await response.json();
+            showToast(`Archived ${result.archivedCount} emails from ${filter.from}`, "success");
+
+            // Refresh to update counts
+            fetchAnalysis();
+        } catch (error) {
+            console.error("Archive error:", error);
+            showToast("Failed to archive emails", "error");
         }
     };
 
@@ -171,7 +239,30 @@ export default function Dashboard() {
                 </header>
                 <div className={styles.loadingContainer}>
                     <div className="spinner" />
-                    <p className={styles.loadingText}>Analyzing your inbox...</p>
+                    <h2 className={styles.loadingTitle}>Analyzing Your Inbox</h2>
+                    <p className={styles.loadingStage}>{loadingStage}</p>
+                    <div className={styles.loadingSteps}>
+                        <p className={styles.loadingStep}>
+                            {loadingStage.includes("Connecting") ? "⏳" : "✅"} Connecting to Gmail
+                        </p>
+                        <p className={styles.loadingStep}>
+                            {loadingStage.includes("inbox stats") ? "⏳" :
+                                loadingStage.includes("Connecting") ? "⏸️" : "✅"} Getting inbox stats
+                        </p>
+                        <p className={styles.loadingStep}>
+                            {loadingStage.includes("emails") ? "⏳" :
+                                loadingStage.includes("Connecting") || loadingStage.includes("inbox stats") ? "⏸️" : "✅"} Fetching recent emails
+                        </p>
+                        <p className={styles.loadingStep}>
+                            {loadingStage.includes("existing filters") ? "⏳" :
+                                loadingStage.includes("Connecting") || loadingStage.includes("inbox stats") || loadingStage.includes("emails") ? "⏸️" : "✅"} Checking existing filters
+                        </p>
+                        <p className={styles.loadingStep}>
+                            {loadingStage.includes("counts") ? "⏳" :
+                                loadingStage.includes("Finishing") ? "✅" : "⏸️"} Getting accurate counts
+                        </p>
+                    </div>
+                    <p className={styles.loadingNote}>This may take 30-60 seconds for accurate counts...</p>
                 </div>
             </div>
         );
@@ -255,7 +346,7 @@ export default function Dashboard() {
                                             onClick={() => handleCreateFilter(suggestion)}
                                             className={styles.acceptBtn}
                                         >
-                                            Create Filter
+                                            Create Filter & Archive All
                                         </button>
                                         <a
                                             href={suggestion.latestMessageId
@@ -288,20 +379,55 @@ export default function Dashboard() {
                     </section>
                 )}
 
-                {/* Sender Clusters */}
+                {/* Existing Filters */}
+                {analysis?.existingFilters && analysis.existingFilters.length > 0 && (
+                    <section className={styles.section}>
+                        <div className={styles.sectionHeader}>
+                            <h2 className={styles.sectionTitle}>
+                                <span className={styles.sectionIcon}>📋</span>
+                                Active Filters
+                            </h2>
+                        </div>
+                        {analysis.existingFilters
+                            .filter(f => f.inboxCount > 0)
+                            .map((filter) => (
+                                <div key={filter.id} className={`card ${styles.filterCard}`}>
+                                    <div className={styles.filterHeader}>
+                                        <div>
+                                            <p className={styles.filterDescription}>
+                                                Filter for <strong>{filter.from}</strong>
+                                            </p>
+                                            <code className={styles.filterCriteria}>
+                                                {filter.inboxCountDisplay} emails still in inbox
+                                            </code>
+                                        </div>
+                                        <div className={styles.filterActions}>
+                                            <button
+                                                onClick={() => handleArchiveFromFilter(filter)}
+                                                className={styles.archiveBtn}
+                                            >
+                                                Archive All
+                                            </button>
+                                            <a
+                                                href={`https://mail.google.com/mail/u/0/#search/from%3A${encodeURIComponent(filter.from)}`}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className={styles.openBtn}
+                                            >
+                                                View All
+                                            </a>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                    </section>
+                )}
                 <section className={styles.section}>
                     <div className={styles.sectionHeader}>
                         <h2 className={styles.sectionTitle}>
                             <span className={styles.sectionIcon}>📬</span>
                             Top Senders
                         </h2>
-                        <button
-                            onClick={handleRefresh}
-                            disabled={isRefreshing}
-                            className={styles.refreshBtn}
-                        >
-                            {isRefreshing ? "Refreshing..." : "🔄 Refresh"}
-                        </button>
                     </div>
 
                     {analysis?.clusters && analysis.clusters.length > 0 ? (
@@ -319,7 +445,7 @@ export default function Dashboard() {
                                     </div>
                                     <div className={styles.clusterMeta}>
                                         <div className={styles.clusterCount}>
-                                            <div className={styles.clusterCountValue}>{cluster.count}</div>
+                                            <div className={styles.clusterCountValue}>{cluster.countDisplay || cluster.count}</div>
                                             <div className={styles.clusterCountLabel}>emails</div>
                                         </div>
                                         <div className={styles.clusterActions}>
@@ -342,6 +468,18 @@ export default function Dashboard() {
                     )}
                 </section>
             </main>
+
+            {/* Processing overlay */}
+            {isProcessing && (
+                <div className={styles.processingOverlay}>
+                    <div className={styles.processingModal}>
+                        <div className="spinner" />
+                        <h3 className={styles.processingTitle}>Processing...</h3>
+                        <p className={styles.processingMessage}>{processingMessage}</p>
+                        <p className={styles.processingNote}>This may take a moment for large mailboxes</p>
+                    </div>
+                </div>
+            )}
 
             {/* Toast notification */}
             {toast && (

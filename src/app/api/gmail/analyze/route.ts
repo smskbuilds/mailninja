@@ -34,36 +34,77 @@ export async function GET() {
         // Cluster by sender
         const clusters = clusterByDomain(messages);
 
-        // Generate filter suggestions
-        let filterSuggestions = generateFilterSuggestions(clusters);
+        // Get existing filters to exclude from suggestions
+        const existingFilters = await gmail.getFilters();
+        const existingFilterSenders = new Set(
+            existingFilters
+                .map(f => f.criteria?.from?.toLowerCase())
+                .filter((from): from is string => !!from)
+        );
 
-        // Get accurate counts for filter suggestions (our sample of 200 messages may undercount)
+        // Generate filter suggestions (excluding senders that already have filters)
+        let filterSuggestions = generateFilterSuggestions(clusters);
+        filterSuggestions = filterSuggestions.filter(
+            s => !existingFilterSenders.has(s.criteria.from?.toLowerCase() || "")
+        );
+
+        // Get exact message counts for filter suggestions (only 5, so worth the accuracy)
+        const top5 = filterSuggestions.slice(0, 5);
         const suggestionsWithAccurateCounts = await Promise.all(
-            filterSuggestions.map(async (suggestion) => {
+            top5.map(async (suggestion) => {
                 if (suggestion.criteria.from) {
-                    // Get estimated count from Gmail for this sender (fast)
-                    const accurateCount = await gmail.getMessageCountEstimate(
+                    const exactCount = await gmail.getMessageCount(
                         `from:${suggestion.criteria.from} in:inbox`
                     );
                     return {
                         ...suggestion,
-                        matchCount: accurateCount,
-                        description: `Auto-archive emails from ${suggestion.criteria.from} (${accurateCount} messages)`,
+                        matchCount: exactCount,
+                        description: `Auto-archive emails from ${suggestion.criteria.from} (${exactCount} messages)`,
                     };
                 }
                 return suggestion;
             })
         );
 
-        // Transform clusters for frontend (include message IDs for actions)
-        const clusterData = clusters.map((c) => ({
-            domain: c.domain,
-            sender: c.sender,
-            count: c.count,
-            suggestedAction: c.suggestedAction,
-            suggestedLabel: c.suggestedLabel,
-            messageIds: c.messages.map((m) => m.id),
-        }));
+        // Sort by message count descending (highest first)
+        suggestionsWithAccurateCounts.sort((a, b) => b.matchCount - a.matchCount);
+
+        // Transform clusters for frontend with accurate counts (using fast estimate)
+        const clusterData = await Promise.all(
+            clusters.slice(0, 10).map(async (c) => {
+                const estimate = await gmail.getMessageCountEstimate(
+                    `from:${c.sender} in:inbox`
+                );
+                return {
+                    domain: c.domain,
+                    sender: c.sender,
+                    count: estimate,
+                    countDisplay: estimate >= 200 ? "200+" : String(estimate),
+                    suggestedAction: c.suggestedAction,
+                    suggestedLabel: c.suggestedLabel,
+                    messageIds: c.messages.map((m) => m.id),
+                };
+            })
+        );
+
+        // Transform existing filters for frontend (use exact counts since accuracy matters)
+        const existingFiltersData = await Promise.all(
+            existingFilters
+                .filter(f => f.criteria?.from)
+                .slice(0, 10) // Limit to 10 for performance with exact counting
+                .map(async (f) => {
+                    const from = f.criteria?.from || "";
+                    // Use exact count for active filters since users need accurate numbers
+                    const inboxCount = await gmail.getMessageCount(`from:${from} in:inbox`);
+                    return {
+                        id: f.id,
+                        from,
+                        action: f.action,
+                        inboxCount,
+                        inboxCountDisplay: String(inboxCount),
+                    };
+                })
+        );
 
         return NextResponse.json({
             stats: {
@@ -75,6 +116,7 @@ export async function GET() {
             },
             clusters: clusterData,
             filterSuggestions: suggestionsWithAccurateCounts,
+            existingFilters: existingFiltersData,
         });
     } catch (error) {
         console.error("Analysis error:", error);

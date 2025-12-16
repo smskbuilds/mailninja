@@ -4,7 +4,7 @@ import { GmailClient } from "@/lib/gmail";
 import { NextRequest, NextResponse } from "next/server";
 
 interface ActionRequest {
-    action: "archive" | "createFilter" | "applyLabel";
+    action: "archive" | "createFilter" | "applyLabel" | "archiveFromSender";
     messageIds?: string[];
     criteria?: {
         from?: string;
@@ -15,6 +15,8 @@ interface ActionRequest {
         addLabel?: string;
     };
     labelId?: string;
+    archiveExisting?: boolean;
+    sender?: string;
 }
 
 export async function POST(request: NextRequest) {
@@ -59,10 +61,36 @@ export async function POST(request: NextRequest) {
                     }
                 );
 
+                // Archive existing emails from this sender if requested
+                let archivedCount = 0;
+                if (body.archiveExisting && body.criteria.from) {
+                    // Paginate through all emails from this sender and archive them
+                    let hasMore = true;
+                    let pageToken: string | undefined;
+
+                    while (hasMore) {
+                        const { messages, nextPageToken } = await gmail.getMessages(
+                            500,
+                            pageToken,
+                            `from:${body.criteria.from} in:inbox`
+                        );
+
+                        if (messages.length > 0) {
+                            const messageIds = messages.map(m => m.id);
+                            await gmail.archiveMessages(messageIds);
+                            archivedCount += messageIds.length;
+                        }
+
+                        pageToken = nextPageToken;
+                        hasMore = !!nextPageToken;
+                    }
+                }
+
                 return NextResponse.json({
                     success: true,
                     filter,
-                    message: "Filter created successfully"
+                    archivedCount,
+                    message: `Filter created successfully${archivedCount > 0 ? ` and archived ${archivedCount} emails` : ""}`
                 });
             }
 
@@ -77,6 +105,43 @@ export async function POST(request: NextRequest) {
                 return NextResponse.json({
                     success: true,
                     message: `Applied label to ${body.messageIds.length} messages`
+                });
+            }
+
+            case "archiveFromSender": {
+                if (!body.sender) {
+                    return NextResponse.json(
+                        { error: "Sender email required" },
+                        { status: 400 }
+                    );
+                }
+
+                // Paginate through all emails from this sender in inbox and archive them
+                let archivedCount = 0;
+                let hasMore = true;
+                let pageToken: string | undefined;
+
+                while (hasMore) {
+                    const { messages, nextPageToken } = await gmail.getMessages(
+                        500,
+                        pageToken,
+                        `from:${body.sender} in:inbox`
+                    );
+
+                    if (messages.length > 0) {
+                        const messageIds = messages.map(m => m.id);
+                        await gmail.archiveMessages(messageIds);
+                        archivedCount += messageIds.length;
+                    }
+
+                    pageToken = nextPageToken;
+                    hasMore = !!nextPageToken;
+                }
+
+                return NextResponse.json({
+                    success: true,
+                    archivedCount,
+                    message: `Archived ${archivedCount} emails from ${body.sender}`
                 });
             }
 
