@@ -385,12 +385,33 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
+    gap: var(--space-md);
     margin-bottom: var(--space-md);
+}
+
+.filterContent {
+    flex: 1;
+    min-width: 0;
+    /* Prevents flex items from overflowing */
 }
 
 .filterDescription {
     font-weight: 500;
     margin-bottom: var(--space-xs);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.filterLogicRow {
+    margin-bottom: var(--space-xs);
+}
+
+.filterMetrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+    margin-top: var(--space-xs);
 }
 
 .filterCriteria {
@@ -406,6 +427,7 @@
 .filterActions {
     display: flex;
     gap: var(--space-sm);
+    flex-shrink: 0;
 }
 
 .acceptBtn {
@@ -422,6 +444,23 @@
 .acceptBtn:hover {
     opacity: 0.9;
     transform: translateY(-1px);
+}
+
+.archiveOnlyBtn {
+    background: rgba(245, 158, 11, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    padding: var(--space-xs) var(--space-md);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all var(--transition-fast);
+}
+
+.archiveOnlyBtn:hover {
+    background: rgba(245, 158, 11, 0.25);
+    transform: translateY(-1px);
+    color: #fcd34d;
 }
 
 .rejectBtn {

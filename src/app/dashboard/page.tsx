@@ -102,7 +102,7 @@ export default function Dashboard() {
 
     const abortControllerRef = useRef<AbortController | null>(null);
 
-    const fetchAnalysis = useCallback(async () => {
+    const fetchAnalysis = useCallback(async (isBackground = false) => {
         if (!session?.accessToken) return;
 
         // Abort previous request if active
@@ -115,8 +115,14 @@ export default function Dashboard() {
 
         setLoadingStage("Connecting to Gmail...");
         setLoadingStep(0);
-        // Ensure loading state is true
-        setIsLoading(true);
+
+        // If not background, show full loading modal
+        if (!isBackground) {
+            setIsLoading(true);
+        } else {
+            // If background, show header spinner
+            setIsRefreshing(true);
+        }
 
         try {
             const response = await fetch("/api/gmail/analyze", {
@@ -141,7 +147,7 @@ export default function Dashboard() {
                 buffer = lines.pop() || "";
 
                 for (const line of lines) {
-                    if (line.trim() === "") continue;
+                    if (!line.trim()) continue;
                     try {
                         const message = JSON.parse(line);
 
@@ -329,23 +335,19 @@ export default function Dashboard() {
         setSelectedSuggestion(null);
     };
 
-    const createFilter = async (suggestion: FilterSuggestion) => {
+    // Generic handler for streaming actions
+    const processStreamedAction = async (payload: any, onSuccess: (result: any) => void) => {
         setIsProcessing(true);
-        setProcessingMessage(`Starting filter creation...`);
+        setProcessingMessage("Initializing action...");
 
         try {
             const response = await fetch("/api/gmail/actions", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    action: "createFilter",
-                    criteria: suggestion.criteria,
-                    filterAction: suggestion.action,
-                    archiveExisting: true,
-                }),
+                body: JSON.stringify(payload),
             });
 
-            if (!response.ok) throw new Error("Failed to create filter");
+            if (!response.ok) throw new Error("Failed to execute action");
 
             const reader = response.body?.getReader();
             if (!reader) throw new Error("No response body");
@@ -359,7 +361,7 @@ export default function Dashboard() {
 
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split("\n");
-                buffer = lines.pop() || ""; // Keep incomplete line
+                buffer = lines.pop() || "";
 
                 for (const line of lines) {
                     if (!line.trim()) continue;
@@ -369,13 +371,7 @@ export default function Dashboard() {
                         if (msg.type === "progress") {
                             setProcessingMessage(msg.stage);
                         } else if (msg.type === "result") {
-                            const result = msg.data;
-                            const archivedCount = result.archivedCount || 0;
-                            showToast(
-                                `Filter created successfully` +
-                                (archivedCount > 0 ? ` and archived ${archivedCount} emails` : ""),
-                                "success"
-                            );
+                            onSuccess(msg.data);
                         } else if (msg.type === "error") {
                             throw new Error(msg.error);
                         }
@@ -384,6 +380,28 @@ export default function Dashboard() {
                     }
                 }
             }
+        } catch (error) {
+            console.error("Action error:", error);
+            showToast("Action failed: " + (error instanceof Error ? error.message : "Unknown error"), "error");
+        } finally {
+            setIsProcessing(false);
+            setProcessingMessage("");
+        }
+    };
+
+    const createFilter = async (suggestion: FilterSuggestion) => {
+        await processStreamedAction({
+            action: "createFilter",
+            criteria: suggestion.criteria,
+            filterAction: suggestion.action,
+            archiveExisting: true,
+        }, (result) => {
+            const archivedCount = result.archivedCount || 0;
+            showToast(
+                `Filter created successfully` +
+                (archivedCount > 0 ? ` and archived ${archivedCount} emails` : ""),
+                "success"
+            );
 
             // Remove suggestion from list
             if (analysis) {
@@ -392,13 +410,32 @@ export default function Dashboard() {
                     filterSuggestions: analysis.filterSuggestions.filter(s => s.id !== suggestion.id),
                 });
             }
-        } catch (error) {
-            console.error("Filter error:", error);
-            showToast("Failed to create filter: " + (error instanceof Error ? error.message : "Unknown error"), "error");
-        } finally {
-            setIsProcessing(false);
-            setProcessingMessage("");
+        });
+    };
+
+    const handleArchiveOnly = async (suggestion: FilterSuggestion) => {
+        // Optimistic update: Remove suggestion immediately
+        handleDismissSuggestion(suggestion.id);
+
+        const sender = suggestion.criteria.from || "";
+        if (!sender) {
+            console.error("handleArchiveOnly: No sender found for suggestion", suggestion);
+            return;
         }
+
+        await processStreamedAction({
+            action: "archiveFromSender",
+            sender: sender,
+        }, (result) => {
+            const archivedCount = result.archivedCount || 0;
+            showToast(`Archived ${archivedCount} emails from ${sender}`, "success");
+
+            // Refresh analysis to update counts
+            // We can't just remove the suggestion because the filter wasn't created, 
+            // but the emails are gone, so the suggestion might no longer be valid.
+            // Best to just refresh.
+            fetchAnalysis(true);
+        });
     };
 
     const handleDismissSuggestion = (suggestionId: string) => {
@@ -426,8 +463,8 @@ export default function Dashboard() {
             const result = await response.json();
             showToast(`Archived ${result.archivedCount} emails from ${filter.from}`, "success");
 
-            // Refresh to update counts
-            fetchAnalysis();
+            // Refresh to update counts (Silent)
+            fetchAnalysis(true);
         } catch (error) {
             console.error("Archive error:", error);
             showToast("Failed to archive emails", "error");
@@ -446,8 +483,9 @@ export default function Dashboard() {
                 <div className={styles.loadingContainer}>
                     {/* Visual Progress Bar */}
                     {(() => {
-                        // Parse the progress string: "Scanning primary (Scanned 1200 | Found 800/2000)"
-                        const match = loadingStage.match(/Scanning (.*) \(Scanned (\d+) \| Found (\d+)\/(\d+)\)/);
+                        // Parse the progress string: "Scanning primary (Scanned 1200 | Collected 800/1000 limit)"
+                        // Regex now handles "Found" OR "Collected", and optional " limit" suffix
+                        const match = loadingStage.match(/Scanning (.*) \(Scanned (\d+) \| (?:Found|Collected) (\d+)\/(\d+)(?: limit)?\)/);
 
                         if (match) {
                             const [_, category, scanned, found, target] = match;
@@ -488,13 +526,13 @@ export default function Dashboard() {
                         // Specific UI for "Accurate Counts" step
                         if (loadingStep === 4) {
                             return (
-                                <div className={styles.loadingContainer}>
+                                <>
                                     <div className="spinner" />
                                     <h2 className={styles.loadingTitle}>Verifying Top Senders</h2>
                                     <p className={styles.loadingSubtitle}>
                                         We're double-checking the exact email counts for your biggest clutter sources to ensure our clean-up estimates are 100% accurate.
                                     </p>
-                                </div>
+                                </>
                             );
                         }
 
@@ -581,25 +619,25 @@ export default function Dashboard() {
                             </div>
                             <div className={`card ${styles.statCard}`}>
                                 <div className={styles.statValue}>
-                                    {analysis?.stats.categories.primary || 0}
+                                    {(analysis?.stats.categories.primary || 0).toLocaleString()}
                                 </div>
                                 <div className={styles.statLabel}>Primary</div>
                             </div>
                             <div className={`card ${styles.statCard}`}>
                                 <div className={styles.statValue}>
-                                    {analysis?.stats.categories.updates || 0}
+                                    {(analysis?.stats.categories.updates || 0).toLocaleString()}
                                 </div>
                                 <div className={styles.statLabel}>Updates</div>
                             </div>
                             <div className={`card ${styles.statCard}`}>
                                 <div className={styles.statValue}>
-                                    {analysis?.stats.categories.promotions || 0}
+                                    {(analysis?.stats.categories.promotions || 0).toLocaleString()}
                                 </div>
                                 <div className={styles.statLabel}>Promotions</div>
                             </div>
                             <div className={`card ${styles.statCard}`}>
                                 <div className={styles.statValue}>
-                                    {analysis?.stats.categories.social || 0}
+                                    {(analysis?.stats.categories.social || 0).toLocaleString()}
                                 </div>
                                 <div className={styles.statLabel}>Social</div>
                             </div>
@@ -637,33 +675,38 @@ export default function Dashboard() {
                         {analysis.filterSuggestions.slice(0, 5).map((suggestion) => (
                             <div key={suggestion.id} className={`card ${styles.filterCard}`}>
                                 <div className={styles.filterHeader}>
-                                    <div>
-                                        <p className={styles.filterDescription}>{suggestion.description}</p>
-                                        <div className={styles.filterMetaRow}>
+                                    <div className={styles.filterContent}>
+                                        <p className={styles.filterDescription}>
+                                            {suggestion.description}
+                                        </p>
+                                        <div className={styles.filterLogicRow}>
                                             <code className={styles.filterCriteria}>
-                                                {suggestion.isGrouped
-                                                    ? `Multiple Senders → Review Required`
-                                                    : `from:${suggestion.criteria.from} → skip inbox`
-                                                }
+                                                {suggestion.criteria.from ? `from:${suggestion.criteria.from}` : ''}
+                                                {' → '}
+                                                {suggestion.action.skipInbox ? 'skip inbox' : 'keep in inbox'}
                                             </code>
-                                            {suggestion.metrics && (
-                                                <div className={styles.metricsBadges}>
-                                                    {suggestion.metrics.primary > 0 && (
-                                                        <span className={`${styles.metricBadge} ${styles.metricPrimary}`} title="Effective Primary Inbox Impact">
-                                                            Primary: {suggestion.metrics.primary}
-                                                        </span>
-                                                    )}
-                                                    {suggestion.metrics.promotions > 0 && (
-                                                        <span className={`${styles.metricBadge} ${styles.metricPromo}`} title="Promotions Tab">
-                                                            Promotions: {suggestion.metrics.promotions}
-                                                        </span>
-                                                    )}
-                                                    {suggestion.metrics.updates > 0 && (
-                                                        <span className={`${styles.metricBadge} ${styles.metricUpdates}`} title="Updates Tab">
-                                                            Updates: {suggestion.metrics.updates}
-                                                        </span>
-                                                    )}
-                                                </div>
+                                        </div>
+                                        {/* Metrics Row */}
+                                        <div className={styles.filterMetrics}>
+                                            {(suggestion.metrics?.primary || 0) > 0 && (
+                                                <span className={`${styles.metricBadge} ${styles.metricPrimary}`}>
+                                                    Primary: {suggestion.metrics!.primary}
+                                                </span>
+                                            )}
+                                            {(suggestion.metrics?.updates || 0) > 0 && (
+                                                <span className={`${styles.metricBadge} ${styles.metricUpdates}`}>
+                                                    Updates: {suggestion.metrics!.updates}
+                                                </span>
+                                            )}
+                                            {(suggestion.metrics?.promotions || 0) > 0 && (
+                                                <span className={`${styles.metricBadge} ${styles.metricPromotions}`}>
+                                                    Promotions: {suggestion.metrics!.promotions}
+                                                </span>
+                                            )}
+                                            {(suggestion.metrics?.social || 0) > 0 && (
+                                                <span className={`${styles.metricBadge} ${styles.metricSocial}`}>
+                                                    Social: {suggestion.metrics!.social}
+                                                </span>
                                             )}
                                         </div>
                                     </div>
@@ -673,6 +716,12 @@ export default function Dashboard() {
                                             className={styles.acceptBtn}
                                         >
                                             {suggestion.isGrouped ? "Review Senders & Create" : "Create Filter & Archive All"}
+                                        </button>
+                                        <button
+                                            onClick={() => handleArchiveOnly(suggestion)}
+                                            className={styles.archiveOnlyBtn}
+                                        >
+                                            Archive Only
                                         </button>
                                         <a
                                             href={suggestion.latestMessageId

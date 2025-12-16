@@ -291,57 +291,66 @@ export class GmailClient {
             q: "in:inbox category:primary",
             maxResults: 1,
         });
-
         const hasCategoryTabs = (primaryTest.data.resultSizeEstimate || 0) > 0;
 
         // Use category:primary if tabs are enabled (to match Gmail UI), otherwise use in:inbox
         const baseQuery = hasCategoryTabs ? "in:inbox category:primary" : "in:inbox";
-        const unreadQuery = hasCategoryTabs ? "in:inbox category:primary is:unread" : "in:inbox is:unread";
-
         console.log("Category tabs enabled:", hasCategoryTabs, "Using query:", baseQuery);
 
-        // Get estimate using threads API
-        // We also want breakdown by category for the dashboard
-        const queries = {
-            total: baseQuery,
-            unread: unreadQuery,
-            primary: "in:inbox category:primary",
-            promotions: "in:inbox category:promotions",
-            social: "in:inbox category:social",
-            updates: "in:inbox category:updates"
-        };
-
-        const promises = Object.entries(queries).map(async ([key, q]) => {
-            const response = await this.gmail.users.messages.list({ // Use messages for more accurate "cleaning" stats
-                userId: "me",
-                q,
-                maxResults: 1,
-            });
-            const est = response.data.resultSizeEstimate || 0;
-            // If small, get exact
-            if (est < 500) {
-                const exact = await this.getMessageCount(q, 500);
-                return { key, count: exact.count };
-            }
-            return { key, count: est };
+        // 1. Get fundamental Inbox stats using Labels API (Exact and Fast)
+        const inboxLabel = await this.gmail.users.labels.get({
+            userId: "me",
+            id: "INBOX"
         });
 
-        const results = await Promise.all(promises);
-        const stats = results.reduce((acc, curr) => {
-            acc[curr.key] = curr.count;
-            return acc;
-        }, {} as Record<string, number>);
+        const strictTotal = inboxLabel.data.messagesTotal || 0;
+        const strictUnread = inboxLabel.data.messagesUnread || 0;
+
+        // 2. Get Category breakdowns (Estimates required because "in:inbox AND category:x" is a search)
+        // We only care about this if tabs are enabled, otherwise everything is basically "Primary"
+
+        const categories = {
+            primary: 0,
+            promotions: 0,
+            social: 0,
+            updates: 0
+        };
+
+        if (hasCategoryTabs) {
+            // Use Label API for exact, fast, and uncapped counts.
+            // We use 'messagesUnread' because 'messagesTotal' includes archived mail,
+            // and unread is the best proxy for "stuff requiring attention" in these categories.
+            const labelMap: Record<string, string> = {
+                primary: "CATEGORY_PERSONAL",
+                promotions: "CATEGORY_PROMOTIONS",
+                social: "CATEGORY_SOCIAL",
+                updates: "CATEGORY_UPDATES"
+            };
+
+            const promises = Object.entries(labelMap).map(async ([key, labelId]) => {
+                try {
+                    const res = await this.gmail.users.labels.get({ userId: "me", id: labelId });
+                    return { key, count: res.data.messagesUnread || 0 };
+                } catch (e) {
+                    console.error(`Failed to get label ${labelId}`, e);
+                    return { key, count: 0 };
+                }
+            });
+
+            const results = await Promise.all(promises);
+            results.forEach(r => {
+                categories[r.key as keyof typeof categories] = r.count;
+            });
+        } else {
+            // If no tabs, everything is Primary (roughly)
+            categories.primary = strictTotal;
+        }
 
         return {
-            total: stats.total,
-            unread: stats.unread,
-            categories: {
-                primary: stats.primary,
-                promotions: stats.promotions,
-                social: stats.social,
-                updates: stats.updates
-            },
-            isExact: false, // We use estimates mostly
+            total: strictTotal,
+            unread: strictUnread,
+            categories,
+            isExact: true, // Total is now exact!
             hasCategoryTabs,
         };
     }
@@ -584,8 +593,13 @@ export function clusterByDomain(messages: EmailMessage[]): EmailCluster[] {
         });
     }
 
-    // Sort by count descending
-    return clusters.sort((a, b) => b.count - a.count);
+    // Sort by weighted impact: Primary = 10x, Others = 1x
+    // This prioritizes filters that clean up the Primary inbox
+    return clusters.sort((a, b) => {
+        const scoreA = ((a.metrics?.primary || 0) * 10) + (a.metrics?.promotions || 0) + (a.metrics?.updates || 0) + (a.metrics?.social || 0);
+        const scoreB = ((b.metrics?.primary || 0) * 10) + (b.metrics?.promotions || 0) + (b.metrics?.updates || 0) + (b.metrics?.social || 0);
+        return scoreB - scoreA;
+    });
 }
 
 function isLikelyAutomated(sender: string, domain: string): boolean {
