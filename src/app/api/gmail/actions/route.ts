@@ -4,7 +4,7 @@ import { GmailClient } from "@/lib/gmail";
 import { NextRequest, NextResponse } from "next/server";
 
 interface ActionRequest {
-    action: "archive" | "createFilter" | "applyLabel" | "archiveFromSender";
+    action: "archive" | "createFilter" | "applyLabel" | "archiveFromSender" | "labelAndFilter";
     messageIds?: string[];
     criteria?: {
         from?: string;
@@ -17,6 +17,8 @@ interface ActionRequest {
     labelId?: string;
     archiveExisting?: boolean;
     sender?: string;
+    labelName?: string;
+    skipInbox?: boolean;
 }
 
 // Helper for streaming responses
@@ -89,33 +91,33 @@ export async function POST(request: NextRequest) {
                 if (body.archiveExisting && body.criteria.from) {
                     sendUpdate("Scanning for existing emails...");
 
-                    // Paginate through all emails from this sender and archive them
+                    // Collect ALL message IDs first (faster than fetch-archive-fetch-archive)
+                    const allMessageIds: string[] = [];
                     let hasMore = true;
                     let pageToken: string | undefined;
 
                     while (hasMore) {
                         const { messages, nextPageToken } = await gmail.getMessages(
-                            500,
+                            1000, // Use max batch size
                             pageToken,
                             `from:${body.criteria.from} in:inbox`,
                             (batch, total) => {
-                                // Real-time update during the "collecting" phase
-                                sendUpdate(`Finding emails to archive... (${archivedCount + total} found)`);
+                                sendUpdate(`Finding emails to archive... (${allMessageIds.length + total} found)`);
                             }
                         );
 
-                        if (messages.length > 0) {
-                            sendUpdate(`Archiving batch of ${messages.length} emails...`);
-                            const messageIds = messages.map(m => m.id);
-                            await gmail.archiveMessages(messageIds);
-                            archivedCount += messageIds.length;
-
-                            // Tiny pause to respect rate limits
-                            if (nextPageToken) await new Promise(r => setTimeout(r, 200));
-                        }
-
+                        allMessageIds.push(...messages.map(m => m.id));
                         pageToken = nextPageToken;
                         hasMore = !!nextPageToken;
+                    }
+
+                    // Archive all at once with parallel batching
+                    if (allMessageIds.length > 0) {
+                        sendUpdate(`Archiving ${allMessageIds.length} emails...`);
+                        await gmail.archiveMessages(allMessageIds, (archived, total) => {
+                            sendUpdate(`Archiving... (${archived}/${total})`);
+                        });
+                        archivedCount = allMessageIds.length;
                     }
                 }
 
@@ -142,10 +144,69 @@ export async function POST(request: NextRequest) {
                     throw new Error("Sender email required");
                 }
 
-                sendUpdate(`Archiving emails from ${body.sender}...`);
+                sendUpdate(`Scanning emails from ${body.sender}...`);
 
-                // Paginate through all emails from this sender in inbox and archive them
+                // Collect ALL message IDs first
+                const allMessageIds: string[] = [];
+                let hasMore = true;
+                let pageToken: string | undefined;
+
+                while (hasMore) {
+                    const { messages, nextPageToken } = await gmail.getMessages(
+                        1000, // Use max batch size
+                        pageToken,
+                        `from:${body.sender} in:inbox`,
+                        (batch, total) => {
+                            sendUpdate(`Finding emails to archive... (${allMessageIds.length + total} found)`);
+                        }
+                    );
+
+                    allMessageIds.push(...messages.map(m => m.id));
+                    pageToken = nextPageToken;
+                    hasMore = !!nextPageToken;
+                }
+
+                // Archive all at once with parallel batching
                 let archivedCount = 0;
+                if (allMessageIds.length > 0) {
+                    sendUpdate(`Archiving ${allMessageIds.length} emails...`);
+                    await gmail.archiveMessages(allMessageIds, (archived, total) => {
+                        sendUpdate(`Archiving... (${archived}/${total})`);
+                    });
+                    archivedCount = allMessageIds.length;
+                }
+
+                return {
+                    success: true,
+                    archivedCount,
+                    message: `Archived ${archivedCount} emails from ${body.sender}`
+                };
+            }
+
+            case "labelAndFilter": {
+                if (!body.criteria?.from || !body.labelName) {
+                    throw new Error("Sender criteria and label name required");
+                }
+
+                const skipInbox = body.skipInbox !== false; // Default true
+
+                // 1. Get or create the label
+                sendUpdate(`Getting or creating label: ${body.labelName}...`);
+                const labelId = await gmail.getOrCreateLabel(body.labelName);
+
+                // 2. Create Gmail filter for future messages
+                sendUpdate("Creating filter for future messages...");
+                await gmail.createFilter(
+                    { from: body.criteria.from },
+                    {
+                        addLabelIds: [labelId],
+                        removeLabelIds: skipInbox ? ["INBOX"] : undefined,
+                    }
+                );
+
+                // 3. Find and label existing messages
+                sendUpdate("Finding existing messages...");
+                const allMessageIds: string[] = [];
                 let hasMore = true;
                 let pageToken: string | undefined;
 
@@ -153,30 +214,37 @@ export async function POST(request: NextRequest) {
                     const { messages, nextPageToken } = await gmail.getMessages(
                         500,
                         pageToken,
-                        `from:${body.sender} in:inbox`,
+                        `from:${body.criteria.from} in:inbox`,
                         (batch, total) => {
-                            sendUpdate(`Finding emails to archive... (${archivedCount + total} found)`);
+                            sendUpdate(`Finding messages... (${allMessageIds.length + total} found)`);
                         }
                     );
 
-                    if (messages.length > 0) {
-                        sendUpdate(`Archiving batch of ${messages.length} emails (Total: ${archivedCount})...`);
-                        const messageIds = messages.map(m => m.id);
-                        await gmail.archiveMessages(messageIds);
-                        archivedCount += messageIds.length;
-
-                        // Tiny pause
-                        if (nextPageToken) await new Promise(r => setTimeout(r, 200));
-                    }
-
+                    allMessageIds.push(...messages.map(m => m.id));
                     pageToken = nextPageToken;
                     hasMore = !!nextPageToken;
                 }
 
+                // 4. Apply label and optionally archive
+                let labeledCount = 0;
+                if (allMessageIds.length > 0) {
+                    sendUpdate(`Applying label to ${allMessageIds.length} messages...`);
+                    await gmail.applyLabel(allMessageIds, labelId);
+                    labeledCount = allMessageIds.length;
+
+                    if (skipInbox) {
+                        sendUpdate(`Archiving ${allMessageIds.length} messages...`);
+                        await gmail.archiveMessages(allMessageIds, (archived, total) => {
+                            sendUpdate(`Archiving... (${archived}/${total})`);
+                        });
+                    }
+                }
+
                 return {
                     success: true,
-                    archivedCount,
-                    message: `Archived ${archivedCount} emails from ${body.sender}`
+                    labeledCount,
+                    labelName: body.labelName,
+                    message: `Created filter and labeled ${labeledCount} emails${skipInbox ? " (archived)" : ""}`
                 };
             }
 

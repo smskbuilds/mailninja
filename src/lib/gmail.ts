@@ -95,6 +95,28 @@ export class GmailClient {
         return response.data;
     }
 
+    /**
+     * Get an existing label by name or create it if it doesn't exist.
+     * Supports nested labels with "/" syntax (e.g., "Newsletters/Tech").
+     * @returns The label ID
+     */
+    async getOrCreateLabel(name: string): Promise<string> {
+        const labels = await this.getLabels();
+
+        // Find existing label (case-insensitive match)
+        const existing = labels.find(
+            l => l.name?.toLowerCase() === name.toLowerCase()
+        );
+
+        if (existing?.id) {
+            return existing.id;
+        }
+
+        // Create new label
+        const newLabel = await this.createLabel(name);
+        return newLabel.id!;
+    }
+
     async getMessages(
         maxResults: number = 100,
         pageToken?: string,
@@ -113,18 +135,18 @@ export class GmailClient {
         }
 
         // Fetch messages in batches to avoid rate limits
-        // Increased to 25 based on user feedback (balancing speed vs rate limits)
-        const BATCH_SIZE = 25;
+        // Increased to 50 for faster loading while staying within quota
+        const BATCH_SIZE = 50;
         const messages: EmailMessage[] = [];
         const msgIds = response.data.messages.map(m => m.id!);
 
         for (let i = 0; i < msgIds.length; i += BATCH_SIZE) {
             const batch = msgIds.slice(i, i + BATCH_SIZE);
 
-            // Add a delay between batches to respect rate limits
-            // Reduced to 400ms to allow faster scanning (approx 60-70% quota usage)
+            // Add a small delay between batches to respect rate limits
+            // 250ms provides good balance between speed and rate limit safety
             if (i > 0) {
-                await new Promise(resolve => setTimeout(resolve, 400));
+                await new Promise(resolve => setTimeout(resolve, 250));
             }
 
             const batchResults = await Promise.all(
@@ -201,14 +223,42 @@ export class GmailClient {
         }
     }
 
-    async archiveMessages(messageIds: string[]): Promise<void> {
-        await this.gmail.users.messages.batchModify({
-            userId: "me",
-            requestBody: {
-                ids: messageIds,
-                removeLabelIds: ["INBOX"],
-            },
-        });
+    async archiveMessages(
+        messageIds: string[],
+        onProgress?: (archived: number, total: number) => void
+    ): Promise<void> {
+        if (messageIds.length === 0) return;
+
+        const BATCH_SIZE = 1000; // Gmail API max
+        const MAX_CONCURRENT = 5; // Parallel batch limit
+
+        // Split into chunks of 1000
+        const chunks: string[][] = [];
+        for (let i = 0; i < messageIds.length; i += BATCH_SIZE) {
+            chunks.push(messageIds.slice(i, i + BATCH_SIZE));
+        }
+
+        // Process chunks in parallel with concurrency limit
+        let completed = 0;
+        const processChunk = async (chunk: string[]) => {
+            await this.gmail.users.messages.batchModify({
+                userId: "me",
+                requestBody: {
+                    ids: chunk,
+                    removeLabelIds: ["INBOX"],
+                },
+            });
+            completed += chunk.length;
+            if (onProgress) {
+                onProgress(completed, messageIds.length);
+            }
+        };
+
+        // Process chunks with concurrency limit
+        for (let i = 0; i < chunks.length; i += MAX_CONCURRENT) {
+            const batch = chunks.slice(i, i + MAX_CONCURRENT);
+            await Promise.all(batch.map(processChunk));
+        }
     }
 
     async applyLabel(messageIds: string[], labelId: string): Promise<void> {

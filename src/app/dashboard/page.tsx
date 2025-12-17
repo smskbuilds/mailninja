@@ -72,6 +72,11 @@ interface ExistingFilter {
     inboxCountDisplay: string;
 }
 
+interface GmailLabel {
+    id: string;
+    name: string;
+}
+
 interface AnalysisResult {
     stats: InboxStats;
     clusters: EmailCluster[];
@@ -94,6 +99,14 @@ export default function Dashboard() {
     const [loadingStep, setLoadingStep] = useState(0);
     const [selectedSuggestion, setSelectedSuggestion] = useState<FilterSuggestion | null>(null);
     const [excludedSenders, setExcludedSenders] = useState<Set<string>>(new Set());
+
+    // Label modal state
+    const [labelModalOpen, setLabelModalOpen] = useState(false);
+    const [labelModalSuggestion, setLabelModalSuggestion] = useState<FilterSuggestion | null>(null);
+    const [availableLabels, setAvailableLabels] = useState<GmailLabel[]>([]);
+    const [selectedLabelName, setSelectedLabelName] = useState("");
+    const [newLabelName, setNewLabelName] = useState("");
+    const [skipInboxChecked, setSkipInboxChecked] = useState(true);
 
     const showToast = (message: string, type: "success" | "error") => {
         setToast({ message, type });
@@ -280,15 +293,76 @@ export default function Dashboard() {
 
     useEffect(() => {
         if (session?.accessToken) {
-            // Fetch trusted senders
-            fetch("/api/settings/trusted")
+            // TODO: Re-enable when using Vercel KV or database storage
+            // Trusted senders disabled for serverless deployment
+            // fetch("/api/settings/trusted")
+            //     .then(res => res.json())
+            //     .then(data => {
+            //         if (data.senders) setTrustedSenders(data.senders);
+            //     })
+            //     .catch(err => console.error("Failed to fetch trusted senders", err));
+
+            // Fetch available labels
+            fetch("/api/gmail/labels")
                 .then(res => res.json())
                 .then(data => {
-                    if (data.senders) setTrustedSenders(data.senders);
+                    if (data.labels) setAvailableLabels(data.labels);
                 })
-                .catch(err => console.error("Failed to fetch trusted senders", err));
+                .catch(err => console.error("Failed to fetch labels", err));
         }
     }, [session?.accessToken]);
+
+    const handleOpenLabelModal = (suggestion: FilterSuggestion) => {
+        setLabelModalSuggestion(suggestion);
+        setSelectedLabelName("");
+        setNewLabelName("");
+        setSkipInboxChecked(true);
+        setLabelModalOpen(true);
+    };
+
+    const handleConfirmLabelAction = async () => {
+        if (!labelModalSuggestion) return;
+
+        const labelName = selectedLabelName === "__new__" ? newLabelName : selectedLabelName;
+
+        if (!labelName) {
+            showToast("Please select or enter a label name", "error");
+            return;
+        }
+
+        setLabelModalOpen(false);
+
+        await processStreamedAction({
+            action: "labelAndFilter",
+            criteria: labelModalSuggestion.criteria,
+            labelName: labelName,
+            skipInbox: skipInboxChecked,
+        }, (result) => {
+            const labeledCount = result.labeledCount || 0;
+            showToast(
+                `Created filter and labeled ${labeledCount} emails with "${labelName}"` +
+                (skipInboxChecked ? " (archived)" : ""),
+                "success"
+            );
+
+            // Remove suggestion from list
+            if (analysis) {
+                setAnalysis({
+                    ...analysis,
+                    filterSuggestions: analysis.filterSuggestions.filter(
+                        s => s.id !== labelModalSuggestion.id
+                    ),
+                });
+            }
+
+            // Add new label to available list if it was new
+            if (selectedLabelName === "__new__" && newLabelName) {
+                setAvailableLabels(prev => [...prev, { id: "new", name: newLabelName }]);
+            }
+        });
+
+        setLabelModalSuggestion(null);
+    };
 
     const handleConfirmFilter = async () => {
         if (!selectedSuggestion) return;
@@ -710,43 +784,55 @@ export default function Dashboard() {
                                             )}
                                         </div>
                                     </div>
-                                    <div className={styles.filterActions}>
-                                        <button
-                                            onClick={() => handleCreateFilter(suggestion)}
-                                            className={styles.acceptBtn}
-                                        >
-                                            {suggestion.isGrouped ? "Review Senders & Create" : "Create Filter & Archive All"}
-                                        </button>
-                                        <button
-                                            onClick={() => handleArchiveOnly(suggestion)}
-                                            className={styles.archiveOnlyBtn}
-                                        >
-                                            Archive Only
-                                        </button>
-                                        <a
-                                            href={suggestion.latestMessageId
-                                                ? `https://mail.google.com/mail/u/0/#inbox/${suggestion.latestMessageId}`
-                                                : `https://mail.google.com/mail/u/0/#search/from%3A${encodeURIComponent(suggestion.criteria.from || '')}`}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className={styles.openBtn}
-                                        >
-                                            Open Latest
-                                        </a>
-                                        <a
-                                            href={`https://mail.google.com/mail/u/0/#search/from%3A${encodeURIComponent(suggestion.criteria.from || '')}`}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className={styles.openBtn}
-                                        >
-                                            View All
-                                        </a>
-                                        <button
-                                            onClick={() => handleDismissSuggestion(suggestion.id)}
-                                            className={styles.rejectBtn}
-                                        >
-                                            Dismiss
-                                        </button>
+                                    <div className={styles.filterActionsContainer}>
+                                        {/* Primary Actions Row */}
+                                        <div className={styles.filterActionsRow}>
+                                            <button
+                                                onClick={() => handleCreateFilter(suggestion)}
+                                                className={styles.acceptBtn}
+                                            >
+                                                {suggestion.isGrouped ? "Review Senders & Create" : "Create Filter & Archive"}
+                                            </button>
+                                            <button
+                                                onClick={() => handleArchiveOnly(suggestion)}
+                                                className={styles.archiveOnlyBtn}
+                                            >
+                                                Archive Only
+                                            </button>
+                                            <button
+                                                onClick={() => handleOpenLabelModal(suggestion)}
+                                                className={styles.labelActionBtn}
+                                            >
+                                                🏷️ Move to Label
+                                            </button>
+                                        </div>
+                                        {/* Secondary Actions Row */}
+                                        <div className={styles.filterActionsRowSecondary}>
+                                            <a
+                                                href={suggestion.latestMessageId
+                                                    ? `https://mail.google.com/mail/u/0/#inbox/${suggestion.latestMessageId}`
+                                                    : `https://mail.google.com/mail/u/0/#search/from%3A${encodeURIComponent(suggestion.criteria.from || '')}`}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className={styles.secondaryBtn}
+                                            >
+                                                Open Latest
+                                            </a>
+                                            <a
+                                                href={`https://mail.google.com/mail/u/0/#search/from%3A${encodeURIComponent(suggestion.criteria.from || '')}`}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className={styles.secondaryBtn}
+                                            >
+                                                View All
+                                            </a>
+                                            <button
+                                                onClick={() => handleDismissSuggestion(suggestion.id)}
+                                                className={styles.dismissBtn}
+                                            >
+                                                Dismiss
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -845,7 +931,7 @@ export default function Dashboard() {
                     )}
                 </section>
 
-                {/* Trusted Senders Section */}
+                {/* Trusted Senders Section - Disabled for serverless deployment
                 {trustedSenders.length > 0 && (
                     <section className={styles.section}>
                         <div className={styles.sectionHeader}>
@@ -881,6 +967,7 @@ export default function Dashboard() {
                         </div>
                     </section>
                 )}
+                */}
             </main>
 
             {/* Review Modal */}
@@ -966,6 +1053,85 @@ export default function Dashboard() {
                                 onClick={handleConfirmFilter}
                             >
                                 Create Filter ({selectedSuggestion.senderDetails!.length - excludedSenders.size} senders)
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Label Modal */}
+            {labelModalOpen && labelModalSuggestion && (
+                <div className={styles.modalOverlay}>
+                    <div className={styles.modal}>
+                        <div className={styles.modalHeader}>
+                            <h3 className={styles.modalTitle}>Move to Label</h3>
+                            <p className={styles.modalSubtitle}>
+                                Create a filter for <strong>{labelModalSuggestion.criteria.from}</strong> and apply a label to all matching emails.
+                            </p>
+                        </div>
+
+                        <div className={styles.labelForm}>
+                            <div className={styles.formGroup}>
+                                <label className={styles.formLabel}>Select Label</label>
+                                <select
+                                    value={selectedLabelName}
+                                    onChange={(e) => setSelectedLabelName(e.target.value)}
+                                    className={styles.labelSelect}
+                                >
+                                    <option value="">-- Choose a label --</option>
+                                    {availableLabels.map((label) => (
+                                        <option key={label.id} value={label.name}>
+                                            {label.name}
+                                        </option>
+                                    ))}
+                                    <option value="__new__">➕ Create new label...</option>
+                                </select>
+                            </div>
+
+                            {selectedLabelName === "__new__" && (
+                                <div className={styles.formGroup}>
+                                    <label className={styles.formLabel}>New Label Name</label>
+                                    <input
+                                        type="text"
+                                        value={newLabelName}
+                                        onChange={(e) => setNewLabelName(e.target.value)}
+                                        placeholder="e.g. Newsletters/Tech"
+                                        className={styles.labelInput}
+                                    />
+                                    <p className={styles.formHint}>
+                                        Use / for nested labels (e.g. &quot;Parent/Child&quot;)
+                                    </p>
+                                </div>
+                            )}
+
+                            <div className={styles.formGroup}>
+                                <label className={styles.checkboxLabel}>
+                                    <input
+                                        type="checkbox"
+                                        checked={skipInboxChecked}
+                                        onChange={(e) => setSkipInboxChecked(e.target.checked)}
+                                    />
+                                    <span>Skip inbox (archive after labeling)</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div className={styles.modalActions}>
+                            <button
+                                className={styles.cancelBtn}
+                                onClick={() => {
+                                    setLabelModalOpen(false);
+                                    setLabelModalSuggestion(null);
+                                }}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                className={styles.confirmBtn}
+                                onClick={handleConfirmLabelAction}
+                                disabled={!selectedLabelName || (selectedLabelName === "__new__" && !newLabelName)}
+                            >
+                                Create Filter & Apply Label
                             </button>
                         </div>
                     </div>

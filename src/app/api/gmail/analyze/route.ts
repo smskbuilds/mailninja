@@ -4,6 +4,25 @@ import { authOptions } from "../../auth/[...nextauth]/route";
 import { GmailClient, clusterByDomain, generateFilterSuggestions, isLikelyImportant, FilterSuggestion } from "@/lib/gmail";
 import { gmail_v1 } from "googleapis";
 
+// Helper to run promises with concurrency limit
+async function throttledPromiseAll<T>(
+    items: T[],
+    fn: (item: T) => Promise<any>,
+    concurrency: number
+): Promise<any[]> {
+    const results: any[] = [];
+    for (let i = 0; i < items.length; i += concurrency) {
+        const batch = items.slice(i, i + concurrency);
+        const batchResults = await Promise.all(batch.map(fn));
+        results.push(...batchResults);
+        // Small delay between batches to avoid rate limits
+        if (i + concurrency < items.length) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+    }
+    return results;
+}
+
 // Helper to filter suggestions based on existing Gmail filters
 function filterByExistingCriteria(suggestion: FilterSuggestion, existingFilters: gmail_v1.Schema$Filter[]): boolean {
     const fromCriteria = suggestion.criteria.from?.toLowerCase();
@@ -171,60 +190,49 @@ export async function GET(req: Request) {
 
                 sendUpdate("Generating accurate counts...");
 
-                // 6. Accurate counts
+                // 6. Accurate counts - fetch with throttled parallelism to avoid rate limits
                 const top10 = filterSuggestions.slice(0, 10);
-                const suggestionsWithAccurateCounts = [];
 
-                for (const suggestion of top10) {
-                    try {
-                        if (suggestion.criteria.from) {
-                            // Sequential execution with a tiny delay to be safe
-                            if (suggestionsWithAccurateCounts.length > 0) {
-                                await new Promise(r => setTimeout(r, 200));
-                            }
+                const suggestionsWithAccurateCounts = await throttledPromiseAll(
+                    top10,
+                    async (suggestion) => {
+                        try {
+                            if (!suggestion.criteria.from) return suggestion;
 
-                            // Optimized lightweight count to get TOTAL
-                            const { count, nextPageToken } = await gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox`, 500);
-                            const isPlus = !!nextPageToken;
-                            const countDisplay = isPlus ? "500+" : count.toString();
+                            // Fetch total count and all category counts in parallel
+                            const [totalResult, primaryCount, updatesCount, promoCount, socialCount] = await Promise.all([
+                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox`, 500),
+                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:primary`, 500).then(r => r.count),
+                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:updates`, 500).then(r => r.count),
+                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:promotions`, 500).then(r => r.count),
+                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:social`, 500).then(r => r.count)
+                            ]);
+
+                            const { count, nextPageToken } = totalResult;
+                            const countDisplay = nextPageToken ? "500+" : count.toString();
 
                             const description = suggestion.isGrouped && suggestion.senderDetails
                                 ? `Auto-archive emails from ${suggestion.senderDetails.length} senders at ${suggestion.id.replace('filter-', '')} (~${countDisplay} messages)`
                                 : `Auto-archive emails from ${suggestion.criteria.from} (~${countDisplay} messages)`;
 
-                            // Fetch EXACT category counts to ensure dashboard badges are perfectly accurate
-                            // We do this in parallel because we are only doing it for a few items and they are lightweight
-                            const [primaryCount, updatesCount, promoCount, socialCount] = await Promise.all([
-                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:primary`, 1).then(r => r.count === 0 ? 0 : gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:primary`, 500).then(r => r.count)),
-                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:updates`, 1).then(r => r.count === 0 ? 0 : gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:updates`, 500).then(r => r.count)),
-                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:promotions`, 1).then(r => r.count === 0 ? 0 : gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:promotions`, 500).then(r => r.count)),
-                                gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:social`, 1).then(r => r.count === 0 ? 0 : gmail.getMessageCount(`from:${suggestion.criteria.from} in:inbox category:social`, 500).then(r => r.count))
-                            ]);
-
-                            // Note: We use a "Check 1 then Check Full" strategy above to save quota on empty categories
-
-                            const exactMetrics = {
-                                primary: primaryCount,
-                                updates: updatesCount,
-                                promotions: promoCount,
-                                social: socialCount
-                            };
-
-                            suggestionsWithAccurateCounts.push({
+                            return {
                                 ...suggestion,
                                 matchCount: count,
                                 description,
-                                metrics: exactMetrics
-                            });
-                        } else {
-                            suggestionsWithAccurateCounts.push(suggestion);
+                                metrics: {
+                                    primary: primaryCount,
+                                    updates: updatesCount,
+                                    promotions: promoCount,
+                                    social: socialCount
+                                }
+                            };
+                        } catch (err) {
+                            console.error(`Failed to get accurate count for suggestion ${suggestion.id}`, err);
+                            return suggestion;
                         }
-                    } catch (err) {
-                        console.error(`Failed to get accurate count for suggestion ${suggestion.id}`, err);
-                        // Fallback: push the original suggestion without accurate counts
-                        suggestionsWithAccurateCounts.push(suggestion);
-                    }
-                }
+                    },
+                    3 // Process 3 suggestions at a time
+                );
 
                 suggestionsWithAccurateCounts.sort((a, b) => {
                     const primaryA = a.metrics?.primary || 0;
@@ -234,7 +242,7 @@ export async function GET(req: Request) {
                 });
 
                 // Transform clusters for frontend (limit to 20 for performance)
-                // 5. Sort by IMPACT (Primary emails count 3x more than Updates/Promotions)
+                // Sort by IMPACT (Primary emails count 3x more than Updates/Promotions)
                 const topClusters = clusters
                     .sort((a, b) => {
                         const scoreA = (a.metrics?.primary || 0) * 3 + a.count;
@@ -243,39 +251,40 @@ export async function GET(req: Request) {
                     })
                     .slice(0, 20);
 
-                // Sequential to avoid rate limits
-                const clusterData = [];
-                for (const c of topClusters) {
-                    try {
-                        const estimate = await gmail.getMessageCountEstimate(
-                            `from:${c.sender} in:inbox`
-                        );
-                        clusterData.push({
-                            domain: c.domain,
-                            sender: c.sender,
-                            count: estimate,
-                            countDisplay: estimate >= 500 ? "500+" : String(estimate),
-                            suggestedAction: c.suggestedAction,
-                            suggestedLabel: c.suggestedLabel,
-                            messageIds: c.messages.map((m) => m.id),
-                            metrics: c.metrics
-                        });
-                        // Tiny pause
-                        await new Promise(r => setTimeout(r, 50));
-                    } catch (e) {
-                        // Fallback if estimate fails
-                        clusterData.push({
-                            domain: c.domain,
-                            sender: c.sender,
-                            count: c.messages.length, // Use local count
-                            countDisplay: String(c.messages.length),
-                            suggestedAction: c.suggestedAction,
-                            suggestedLabel: c.suggestedLabel,
-                            messageIds: c.messages.map((m) => m.id),
-                            metrics: c.metrics
-                        });
-                    }
-                }
+                // Fetch cluster estimates with throttled parallelism
+                const clusterData = await throttledPromiseAll(
+                    topClusters,
+                    async (c) => {
+                        try {
+                            const estimate = await gmail.getMessageCountEstimate(
+                                `from:${c.sender} in:inbox`
+                            );
+                            return {
+                                domain: c.domain,
+                                sender: c.sender,
+                                count: estimate,
+                                countDisplay: estimate >= 500 ? "500+" : String(estimate),
+                                suggestedAction: c.suggestedAction,
+                                suggestedLabel: c.suggestedLabel,
+                                messageIds: c.messages.map((m) => m.id),
+                                metrics: c.metrics
+                            };
+                        } catch (e) {
+                            // Fallback if estimate fails
+                            return {
+                                domain: c.domain,
+                                sender: c.sender,
+                                count: c.messages.length,
+                                countDisplay: String(c.messages.length),
+                                suggestedAction: c.suggestedAction,
+                                suggestedLabel: c.suggestedLabel,
+                                messageIds: c.messages.map((m) => m.id),
+                                metrics: c.metrics
+                            };
+                        }
+                    },
+                    5 // Process 5 clusters at a time
+                );
 
                 // Transform existing filters for frontend
                 // Sequential to avoid rate limits
